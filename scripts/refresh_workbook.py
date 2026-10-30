@@ -9,6 +9,7 @@ import json
 import re
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, date
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -75,46 +76,61 @@ def main():
                 put(sheet,address,value,(formulas or {}).get(address),styles.get(column(n)))
         return len(rows)+5
     products=sorted(data['products'],key=lambda p:(-p['soldout_weeks'],-p['sellout_rate'],-p['total_sold_units'],str(p['product_id'])))
-    anomalies={(r['week_id'],r['product_id']) for r in data.get('quality',{}).get('anomaly_rows',[])}
+    anomalies={(r['week_id'],r['product_id']) for r in data.get('quality',{}).get('anomaly_rows',[]) if any(i!='duplicate_product_week' for i in r.get('issues',[]))}
     rows=[];formulas={}
     for i,p in enumerate(products):
         r=i+6;hist={h[0]:h for h in p['history']}
         states=[]
         for w in data['weeks']:
             h=hist.get(w['id'])
-            states.append('Not allocated' if h is None else 'Data review' if (w['id'],p['product_id']) in anomalies else 'Sold out' if h[3]==0 and h[2]==h[1] and h[2]>0 else '90%+ sold' if h[2]/h[1]>=.9 else 'Available')
-        rows.append([i+1,str(p['product_id']),p['product_name'],p['brand_name'],p['category_name'],p['weeks_available'],p['soldout_weeks'],p['soldout_weeks']/p['weeks_available'],p['total_allocated_units'],p['total_sold_units'],p['total_unsold_units'],p['total_sold_units']/p['total_allocated_units'],p['median_weekly_allocated'],p.get('longest_sellout_streak',0),p.get('latest_sellout_streak',0),p.get('latest_week_state',''),flag(p),p['total_sold_revenue'],*states])
+            states.append('Not allocated' if h is None else 'Data review' if (w['id'],p['product_id']) in anomalies else 'Sold out' if h[3]==0 and h[2]==h[1] and h[2]>0 else '90%+ sold' if h[1] and h[2]/h[1]>=.9 else 'Available')
+        rows.append([i+1,str(p['product_id']),p['product_name'],p['brand_name'],p['category_name'],p['weeks_available'],p['soldout_weeks'],p['soldout_weeks']/p['weeks_available'] if p['weeks_available'] else 0,p['total_allocated_units'],p['total_sold_units'],p['total_unsold_units'],p['total_sold_units']/p['total_allocated_units'] if p['total_allocated_units'] else 0,p['median_weekly_allocated'],p.get('longest_sellout_streak',0),p.get('latest_sellout_streak',0),p.get('latest_week_state',''),flag(p),p['total_sold_revenue'],*states])
         formulas[f'H{r}']=f'G{r}/F{r}';formulas[f'L{r}']=f'J{r}/I{r}'
     r_end=replace_rows(ranking,rows,formulas)
     for n,w in enumerate(data['weeks'],19):put(ranking,f'{column(n)}5',w['period_from'][:10])
-    included={(w[0],p['product_id']) for p in products for w in p['history']}
-    excluded={(r['week_id'],r['product_id']):r['reason'] for r in data.get('excluded_product_rows',[])}
+    included={(w[0],p['product_id']):w for p in products for w in p['history']}
+    excluded=defaultdict(list)
+    for r in data.get('excluded_product_rows',[]):
+        excluded[(r['week_id'],r['product_id'])].append(dict(r))
+    seen_included=set()
     raw_rows=[]
     for w in sorted(raw['allocations'],key=lambda w:w['period_from']):
         for p in w['products']:
-            key=(w['inventory_allocation_id'],p['product_id']);inc=key in included
+            key=(w['inventory_allocation_id'],p['product_id'])
+            ex_list=excluded.get(key,[])
+            non_dup=next((r for r in ex_list if r['reason']!='duplicate_product_week' and r.get('product_name')==p.get('product_name') and r.get('allocated_units')==p.get('allocated_units') and r.get('sold_units')==p.get('sold_units')),None)
+            if non_dup is not None:
+                ex_list.remove(non_dup);inc=False;reason=non_dup['reason']
+            elif key in included and key not in seen_included:
+                seen_included.add(key);inc=True;reason=''
+            else:
+                inc=False;dup=ex_list.pop(0) if ex_list else None;reason=dup['reason'] if dup else 'Excluded by eligibility rules'
             valid=inc and key not in anomalies
-            raw_rows.append([str(key[0]),serial(w['period_from']),serial(w['period_to']),str(p['product_id']),p['product_name'],p['brand_name'],p['category_name'],str(p['inventory_allocation_item_id']),p['allocated_units'],p['sold_units'],p['unsold_units'],p['sell_through'],p['sold_revenue'],p['order_count'],bool(p['unlimited']),'Yes' if inc else 'No','Data review' if key in anomalies else '' if inc else excluded.get(key,'Excluded by eligibility rules'),'Yes' if valid and p['unsold_units']==0 and p['sold_units']==p['allocated_units'] and p['sold_units']>0 else 'No','Yes' if valid and p['sold_units']/p['allocated_units']>=.9 else 'No',w.get('updated_at','')])
+            alloc=p.get('allocated_units') or 0;sold=p.get('sold_units') or 0;unsold=p.get('unsold_units')
+            raw_rows.append([str(key[0]),serial(w['period_from']),serial(w['period_to']),str(p['product_id']),p['product_name'],p['brand_name'],p['category_name'],str(p['inventory_allocation_item_id']),p['allocated_units'],p['sold_units'],p['unsold_units'],p['sell_through'],p['sold_revenue'],p['order_count'],bool(p['unlimited']),'Yes' if inc else 'No','Data review' if inc and key in anomalies else '' if inc else reason,'Yes' if valid and unsold==0 and sold==alloc and sold>0 else 'No','Yes' if valid and alloc>0 and sold/alloc>=.9 else 'No',w.get('updated_at','')])
     d_end=replace_rows(detail,raw_rows)
     assert len(raw_rows)==data['summary']['source_row_count']
-    assert len(included)==data['summary']['eligible_product_weeks']
+    assert len(seen_included)==len(included)==data['summary']['eligible_product_weeks']
     assert sum(p['soldout_weeks'] for p in products)==data['summary']['exact_sellout_occurrences']
     put(detail,'A4',f"Source: {data['source']['url']} | Generated: {raw['generated_at']} | Sales statuses: {', '.join(raw['sold_order_statuses'])}")
     s=data['summary'];put(summary,'A4',f"{s['period_from']} to {s['period_to']} | Eight completed Sunday–Saturday weeks")
     for address,value in [('B7',len(products)),('B8',sum(p['soldout_weeks']>=3 for p in products)),('B9',len(included)),('B10',sum(p['soldout_weeks'] for p in products)),('B11',len(raw_rows))]:put(summary,address,value)
     alloc=sum(p['total_allocated_units'] for p in products);sold=sum(p['total_sold_units'] for p in products)
-    put(summary,'E7',alloc,f"SUM('Product rankings'!I6:I{r_end})");put(summary,'E8',sold,f"SUM('Product rankings'!J6:J{r_end})");put(summary,'E9',sold/alloc,'E8/E7')
+    put(summary,'E7',alloc,f"SUM('Product rankings'!I6:I{r_end})");put(summary,'E8',sold,f"SUM('Product rankings'!J6:J{r_end})");put(summary,'E9',sold/alloc if alloc else 0,'E8/E7')
     for r,w in enumerate(data['weeks'],15):
-        vals=[w['period_from'][5:10],w['eligible_product_count'],w['eligible_allocated_units'],w['eligible_sold_units'],w['exact_sellouts'],w['eligible_sold_units']/w['eligible_allocated_units']]
+        vals=[w['period_from'][5:10],w['eligible_product_count'],w['eligible_allocated_units'],w['eligible_sold_units'],w['exact_sellouts'],w['eligible_sold_units']/w['eligible_allocated_units'] if w['eligible_allocated_units'] else 0]
         for n,v in enumerate(vals,1):put(summary,f'{column(n)}{r}',v,f'D{r}/C{r}' if n==6 else None)
     for i in range(12):
         p=products[i] if i<len(products) else None
-        values=[p['product_name'],p['soldout_weeks'],p['weeks_available'],p['soldout_weeks']/p['weeks_available']] if p else [None]*4
+        values=[p['product_name'],p['soldout_weeks'],p['weeks_available'],p['soldout_weeks']/p['weeks_available'] if p['weeks_available'] else 0] if p else [None]*4
         for n,(v,source_col) in enumerate(zip(values,['C','G','F','H']),1):put(summary,f'{column(n)}{i+28}',v,f"'Product rankings'!{source_col}{i+6}" if p else None)
         put(summary,f'E{i+28}',flag(p).replace('4+ weeks; median 25+ units','Comparable history') if p else '')
     for address,value in [('B21',len(raw_rows)),('B22',len(included)),('B23',len(raw_rows)-len(included)),('B24',raw['generated_at']),('B25',data['source']['url'])]:put(method,address,value)
+    put(method,'B6',f"Historical completed weekly wholesale allocations; {raw.get('state_code') or data.get('source',{}).get('state_code') or 'WA'}; source timezone {data.get('source',{}).get('timezone') or 'America/Los_Angeles'}.")
     put(method,'B7','Positive allocation; sold equals allocated; zero remaining units; no quantity or source consistency anomalies.')
     put(method,'B11','Sold units divided by allocated units at least 90%; includes exact sellouts; source anomalies block the classification.')
+    put(method,'B15',data.get('criteria',{}).get('excluded','Unlimited or zero allocations, trade samples, merchandise and invalid quantity records.'))
+    put(method,'B16',', '.join(raw.get('sold_order_statuses',[])))
     for i,sheet in enumerate(sheets,1):
         # XLSX requires row/cell address order after appending refreshed cells.
         sd=sheet.find(q('sheetData'))

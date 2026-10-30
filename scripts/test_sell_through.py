@@ -21,6 +21,17 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(p['latest_week_state'],'not_offered')
         self.assertEqual(p['latest_sellout_streak'],0)
 
+    def test_non_adjacent_calendar_weeks_break_streak(self):
+        result=build_dataset({'generated_at':'2026-10-18T18:00:00Z','allocations':[
+            {'inventory_allocation_id':'w1','period_from':'2026-09-01','period_to':'2026-09-07','products':[product()]},
+            {'inventory_allocation_id':'w2','period_from':'2026-09-08','period_to':'2026-09-14','products':[product()]},
+            {'inventory_allocation_id':'w4','period_from':'2026-09-22','period_to':'2026-09-28','products':[product()]},
+        ]})
+        p=result['products'][0]
+        self.assertEqual(p['soldout_weeks'],3)
+        self.assertEqual(p['longest_sellout_streak'],2)
+        self.assertEqual(p['latest_sellout_streak'],1)
+
     def test_zero_unsold_with_unreconciled_sale_is_not_sellout(self):
         p=product(sold=50);p['unsold_units']=0
         result=dataset([[p]])
@@ -68,10 +79,21 @@ class RulesTest(unittest.TestCase):
         result=dataset([[product(),product()]])
         self.assertEqual(result['products'][0]['weeks_available'],1)
         self.assertEqual(result['quality']['anomaly_counts']['duplicate_product_week'],1)
+        self.assertEqual(result['summary']['excluded_rows']['duplicate_product_week'],1)
+        self.assertEqual(result['summary']['eligible_product_weeks']+sum(result['summary']['excluded_rows'].values()),result['summary']['source_row_count'])
+
+    def test_excluded_row_before_valid_row_does_not_shadow_valid_product_week(self):
+        result=dataset([[product(type='sample'),product()]])
+        self.assertEqual(len(result['products']),1)
+        self.assertEqual(result['products'][0]['weeks_available'],1)
+        self.assertEqual(result['products'][0]['soldout_weeks'],1)
+        self.assertEqual(result['summary']['excluded_rows'],{'trade_samples':1})
+        self.assertEqual(result['quality']['anomaly_counts'],{})
 
     def test_partial_week_is_excluded_from_completed_history(self):
         result=build_dataset({'generated_at':'2026-10-18T18:00:00Z','allocations':[{'inventory_allocation_id':'future','period_from':'2026-10-18','period_to':'2026-10-24','products':[product()]}]})
-        self.assertFalse(result['weeks'][0]['is_completed'])
+        self.assertEqual(result['weeks'],[])
+        self.assertEqual(result['summary']['week_count'],0)
         self.assertEqual(result['summary']['product_count'],0)
         self.assertEqual(result['summary']['excluded_rows']['incomplete_week'],1)
 

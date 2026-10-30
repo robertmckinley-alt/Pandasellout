@@ -5,11 +5,13 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 // Use the bundled artifact runtime locally. Set ARTIFACT_TOOL_MODULE elsewhere.
-const resolveBundled=createRequire(path.join(os.homedir(),'.cache/codex-runtimes/codex-primary-runtime/dependencies/node/runner.cjs'));
-const modulePath = process.env.ARTIFACT_TOOL_MODULE || resolveBundled.resolve('@oai/artifact-tool');
 let artifact;
 try { artifact = await import('@oai/artifact-tool'); }
-catch { artifact = await import(pathToFileURL(modulePath).href); }
+catch {
+  const resolveBundled = createRequire(path.join(os.homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/runner.cjs'));
+  const modulePath = process.env.ARTIFACT_TOOL_MODULE || resolveBundled.resolve('@oai/artifact-tool');
+  artifact = await import(pathToFileURL(modulePath).href);
+}
 const {Workbook, SpreadsheetFile} = artifact;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const data = JSON.parse(await fs.readFile(path.join(root,'data/allocation_sell_through.json'),'utf8'));
@@ -25,9 +27,9 @@ function header(sheet,range){sheet.getRange(range).format={fill:blue,font:{name:
 function title(sheet,text,end){sheet.getRange('A2').values=[[text]];sheet.getRange('A2').format.font={name:'Arial',size:16,bold:true,color:blue};sheet.getRange(`A3:${end}3`).format.borders={bottom:{style:'thin',color:'#D8E3E6'}};}
 function table(sheet,range,name){const t=sheet.tables.add(range,true,name);t.showFilterButton=true;}
 const products=[...data.products].sort((a,b)=>b.soldout_weeks-a.soldout_weeks||b.sellout_rate-a.sellout_rate||b.total_sold_units-a.total_sold_units||String(a.product_id).localeCompare(String(b.product_id)));
-const anomalies=new Set((data.quality?.anomaly_rows||[]).map(r=>String(r.week_id)+'|'+String(r.product_id)));
+const anomalies=new Set((data.quality?.anomaly_rows||[]).filter(r=>(r.issues||[]).some(i=>i!=='duplicate_product_week')).map(r=>String(r.week_id)+'|'+String(r.product_id)));
 const rankHeaders=['Rank','Product ID','Product','Brand','Category','Allocated weeks','Sellout weeks','Sellout frequency','Units allocated','Units sold','Units remaining','Weighted sell-through','Median weekly allocation','Longest streak','Latest streak','Latest week state','History / volume flag','Revenue (USD)',...data.weeks.map(w=>String(w.period_from).slice(0,10))];
-const rankRows=products.map((p,i)=>[i+1,String(p.product_id),p.product_name,p.brand_name,p.category_name,p.weeks_available,p.soldout_weeks,null,p.total_allocated_units,p.total_sold_units,p.total_unsold_units,null,p.median_weekly_allocated,p.longest_sellout_streak??0,p.latest_sellout_streak??0,p.latest_week_state??'',p.anomaly_count?'Data review':p.weeks_available<4?'Limited history':p.median_weekly_allocated<25?'Small allocation':'4+ weeks; median 25+ units',p.total_sold_revenue,...data.weeks.map(w=>{const h=p.history.find(h=>h[0]===w.id);return h?(anomalies.has(String(w.id)+'|'+String(p.product_id))?'Data review':h[3]===0&&h[2]===h[1]&&h[2]>0?'Sold out':h[2]/h[1]>=.9?'90%+ sold':'Available'):'Not allocated';})]);
+const rankRows=products.map((p,i)=>[i+1,String(p.product_id),p.product_name,p.brand_name,p.category_name,p.weeks_available,p.soldout_weeks,null,p.total_allocated_units,p.total_sold_units,p.total_unsold_units,null,p.median_weekly_allocated,p.longest_sellout_streak??0,p.latest_sellout_streak??0,p.latest_week_state??'',p.anomaly_count?'Data review':p.weeks_available<4?'Limited history':p.median_weekly_allocated<25?'Small allocation':'4+ weeks; median 25+ units',p.total_sold_revenue,...data.weeks.map(w=>{const h=p.history.find(h=>h[0]===w.id);return h?(anomalies.has(String(w.id)+'|'+String(p.product_id))?'Data review':h[3]===0&&h[2]===h[1]&&h[2]>0?'Sold out':h[1]&&h[2]/h[1]>=.9?'90%+ sold':'Available'):'Not allocated';})]);
 const rEnd=5+rankRows.length,rCol=col(rankHeaders.length);
 style(ranking,`A1:${rCol}${rEnd}`); title(ranking,'Products ranked by exact sellout weeks',rCol);
 ranking.getRange('A4').values=[['Frequency uses allocated weeks. Small allocations and limited history are flagged. Snapshot ranking; rerun refresh to reorder.']];
@@ -42,9 +44,11 @@ ranking.getRange(`Q6:Q${rEnd}`).conditionalFormats.add('containsText',{text:'Sma
 ranking.getRange(`Q6:Q${rEnd}`).conditionalFormats.add('containsText',{text:'Limited',format:{fill:amber}});
 
 const included=new Set(products.flatMap(p=>p.history.map(h=>`${h[0]}|${p.product_id}`)));
-const excluded=new Map((data.excluded_product_rows||[]).map(r=>[`${r.week_id}|${r.product_id}`,r.reason]));
+const excluded=new Map();
+for(const r of data.excluded_product_rows||[]){const k=`${r.week_id}|${r.product_id}`;if(!excluded.has(k))excluded.set(k,[]);excluded.get(k).push({...r});}
+const seenIncluded=new Set();
 const detailHeaders=['Week ID','Week beginning','Week ending','Product ID','Product','Brand','Category','Allocation item ID','Allocated units','Sold units','Remaining units','Source sell-through','Sold revenue (USD)','Orders','Unlimited','Included in rankings','Exclusion reason','Exact sellout','90%+ sold','Source updated at'];
-const detailRows=raw.allocations.slice().sort((a,b)=>String(a.period_from).localeCompare(String(b.period_from))).flatMap(w=>w.products.map(p=>{const inc=included.has(`${w.inventory_allocation_id}|${p.product_id}`);return [String(w.inventory_allocation_id),new Date(w.period_from),new Date(w.period_to),String(p.product_id),p.product_name,p.brand_name,p.category_name,String(p.inventory_allocation_item_id),p.allocated_units,p.sold_units,p.unsold_units,p.sell_through,p.sold_revenue,p.order_count,Boolean(p.unlimited),inc?'Yes':'No',inc?'':excluded.get(`${w.inventory_allocation_id}|${p.product_id}`)||'Excluded by eligibility rules',inc&&!anomalies.has(String(w.inventory_allocation_id)+'|'+String(p.product_id))&&p.unsold_units===0&&p.sold_units===p.allocated_units&&p.sold_units>0?'Yes':'No',inc&&!anomalies.has(String(w.inventory_allocation_id)+'|'+String(p.product_id))&&p.sold_units/p.allocated_units>=.9?'Yes':'No',String(w.updated_at??'')];}));
+const detailRows=raw.allocations.slice().sort((a,b)=>String(a.period_from).localeCompare(String(b.period_from))).flatMap(w=>w.products.map(p=>{const k=`${w.inventory_allocation_id}|${p.product_id}`;const exList=excluded.get(k)||[];const nonDupIdx=exList.findIndex(r=>r.reason!=='duplicate_product_week'&&r.product_name===p.product_name&&r.allocated_units===p.allocated_units&&r.sold_units===p.sold_units);let inc=false,reason='';if(nonDupIdx!==-1){reason=exList.splice(nonDupIdx,1)[0].reason;}else if(included.has(k)&&!seenIncluded.has(k)){seenIncluded.add(k);inc=true;}else{const dup=exList.shift();reason=dup?.reason||'Excluded by eligibility rules';}const valid=inc&&!anomalies.has(k);return [String(w.inventory_allocation_id),new Date(w.period_from),new Date(w.period_to),String(p.product_id),p.product_name,p.brand_name,p.category_name,String(p.inventory_allocation_item_id),p.allocated_units,p.sold_units,p.unsold_units,p.sell_through,p.sold_revenue,p.order_count,Boolean(p.unlimited),inc?'Yes':'No',inc&&anomalies.has(k)?'Data review':inc?'':reason,valid&&p.unsold_units===0&&p.sold_units===p.allocated_units&&p.sold_units>0?'Yes':'No',valid&&p.allocated_units>0&&p.sold_units/p.allocated_units>=.9?'Yes':'No',String(w.updated_at??'')];}));
 const dEnd=detailRows.length+5;
 style(detail,`A1:T${dEnd}`);title(detail,'Complete product-week source records','T');detail.getRange('A4').values=[[`Source: ${data.source.url} | Generated: ${raw.generated_at} | Sales statuses: ${(raw.sold_order_statuses||[]).join(', ')}`]];detail.getRange('A5:T5').values=[detailHeaders];detail.getRange(`A6:T${dEnd}`).values=detailRows;header(detail,'A5:T5');detail.getRange(`A5:T${dEnd}`).format.columnWidth=18;detail.getRange(`A5:A${dEnd}`).format.columnWidth=38;detail.getRange(`D5:D${dEnd}`).format.columnWidth=38;detail.getRange(`E5:E${dEnd}`).format.columnWidth=64;detail.getRange(`F5:H${dEnd}`).format.columnWidth=30;detail.getRange(`Q5:Q${dEnd}`).format.columnWidth=34;detail.getRange(`T5:T${dEnd}`).format.columnWidth=28;detail.getRange(`B6:C${dEnd}`).setNumberFormat('mm/dd/yy');detail.getRange(`I6:K${dEnd}`).setNumberFormat('#,##0');detail.getRange(`L6:L${dEnd}`).setNumberFormat('0.0%');detail.getRange(`M6:M${dEnd}`).setNumberFormat('$#,##0.00');table(detail,`A5:T${dEnd}`,'WeeklySource');detail.freezePanes.freezeRows(5);detail.freezePanes.freezeColumns(5);
 

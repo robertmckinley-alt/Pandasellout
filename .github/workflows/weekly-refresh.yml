@@ -44,4 +44,5 @@ jobs:
             exit 0
           fi
           git commit -m "Refresh eight-week sellout report $(date -u +'%Y-%m-%d')"
+          git pull --rebase origin main
           git push

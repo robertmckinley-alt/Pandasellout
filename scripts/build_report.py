@@ -2,6 +2,7 @@
 from pathlib import Path
 import csv
 import json
+import re
 from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
@@ -12,6 +13,7 @@ from reportlab.graphics.shapes import Drawing, Rect, String, Line
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'downloads'
+FORMULA_RE = re.compile(r'^[=+\-@\t\r]')
 INK = colors.HexColor('#16312c')
 GREEN = colors.HexColor('#087f5b')
 PALE = colors.HexColor('#e9f5ef')
@@ -35,6 +37,12 @@ def num(value):
 def pct(value):
     return f'{value:.1%}'
 
+def safe_csv_value(value):
+    return "'" + value if isinstance(value, str) and FORMULA_RE.match(value) else value
+
+def safe_csv_row(row, fields):
+    return {k: safe_csv_value(row.get(k)) for k in fields}
+
 def table(headers, rows, widths):
     cells = [[para(v, 'TableHead') for v in headers]]
     cells.extend([[para(v, 'TableText') for v in row] for row in rows])
@@ -51,7 +59,7 @@ def table(headers, rows, widths):
 
 def weekly_chart(weeks):
     drawing = Drawing(510, 190)
-    max_count = max(w['exact_sellouts'] for w in weeks) * 1.2
+    max_count = (max((w['exact_sellouts'] for w in weeks), default=0) or 1) * 1.2
     for i, w in enumerate(weeks):
         x = 18 + i * 62
         height = w['exact_sellouts'] / max_count * 115
@@ -59,7 +67,8 @@ def weekly_chart(weeks):
         drawing.add(String(x+19.5, height+43, num(w['exact_sellouts']), textAnchor='middle', fontName='Helvetica-Bold', fontSize=10, fillColor=INK))
         label = w['period_to'][5:].replace('-', '/')
         drawing.add(String(x+19.5, 22, label, textAnchor='middle', fontName='Helvetica', fontSize=8, fillColor=GRAY))
-        drawing.add(String(x+19.5, 9, pct(w['exact_sellouts']/w['eligible_product_count']), textAnchor='middle', fontName='Helvetica', fontSize=8, fillColor=GRAY))
+        rate = w['exact_sellouts'] / w['eligible_product_count'] if w['eligible_product_count'] else 0
+        drawing.add(String(x+19.5, 9, pct(rate), textAnchor='middle', fontName='Helvetica', fontSize=8, fillColor=GRAY))
     drawing.add(Line(10,36,505,36,strokeColor=LINE))
     drawing.add(String(10,176,'Exact sellout occurrences by week',fontName='Helvetica-Bold',fontSize=11,fillColor=INK))
     return drawing
@@ -67,7 +76,7 @@ def weekly_chart(weeks):
 def allocation_chart(product, weeks, columns):
     history = {r['week_id']: r for r in [dict(zip(columns,row)) for row in product['history']]}
     drawing = Drawing(510, 193)
-    highest = max(r['allocated_units'] for r in history.values()) or 1
+    highest = max((r['allocated_units'] for r in history.values()), default=0) or 1
     drawing.add(String(10,179,product['product_name'],fontName='Helvetica-Bold',fontSize=11,fillColor=INK))
     for i, w in enumerate(weeks):
         x = 18+i*62
@@ -85,7 +94,7 @@ def allocation_chart(product, weeks, columns):
 def breakdown(products, field):
     groups = {}
     for p in products:
-        g = groups.setdefault(p[field], {'products':0,'events':0,'offered':0,'sold':0,'allocated':0})
+        g = groups.setdefault(p.get(field) or 'Unspecified', {'products':0,'events':0,'offered':0,'sold':0,'allocated':0})
         g['products'] += 1
         g['events'] += p['soldout_weeks']
         g['offered'] += p['weeks_available']
@@ -102,46 +111,53 @@ def footer(canvas, doc):
     canvas.drawRightString(553,23,str(doc.page))
 
 def write_csvs(data):
+    products = sorted(data['products'], key=lambda p: (-p['soldout_weeks'], -p['sellout_rate'], -p['total_sold_units'], str(p['product_id'])))
+    anomalies = {(r['week_id'], r['product_id']) for r in data.get('quality', {}).get('anomaly_rows', []) if any(i != 'duplicate_product_week' for i in r.get('issues', []))}
     fields = ['product_id','product_name','brand_name','category_name','weeks_available','soldout_weeks','sellout_rate','coverage_rate','latest_sellout_streak','longest_sellout_streak','latest_week_state','total_allocated_units','total_sold_units','total_unsold_units','weighted_sell_through','median_weekly_allocated','signal','rationale']
     with (OUT/'all_product_rankings.csv').open('w',encoding='utf-8-sig',newline='') as f:
-        writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(data['products'])
+        writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(safe_csv_row(p, fields) for p in products)
     weeks={w['id']:w for w in data['weeks']}
     fields=['product_id','product_name','brand_name','category_name','period_from','period_to','allocated_units','sold_units','unsold_units','sell_through','sold_revenue','order_count','exact_sellout']
     with (OUT/'eligible_weekly_detail.csv').open('w',encoding='utf-8-sig',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');writer.writeheader()
-        for p in data['products']:
+        for p in products:
             for values in p['history']:
                 r=dict(zip(data['history_columns'],values));w=weeks[r['week_id']]
-                writer.writerow({**p,**r,'period_from':w['period_from'],'period_to':w['period_to'],'exact_sellout':r['allocated_units']>0 and r['sold_units']>0 and r['unsold_units']==0})
+                exact = (r['week_id'], p['product_id']) not in anomalies and r['allocated_units'] > 0 and r['sold_units'] == r['allocated_units'] and r['unsold_units'] == 0
+                writer.writerow(safe_csv_row({**p,**r,'period_from':w['period_from'],'period_to':w['period_to'],'exact_sellout':exact}, fields))
 
 def build():
     data=json.loads((ROOT/'data/allocation_sell_through.json').read_text(encoding='utf-8'))
     s=data['summary'];weeks=data['weeks'];products=data['products']
-    ranked=sorted(products,key=lambda p:(p['soldout_weeks'],p['sellout_rate'],p['weeks_available'],p['total_sold_units']),reverse=True)
+    ranked=sorted(products,key=lambda p:(-p['soldout_weeks'],-p['sellout_rate'],-p['total_sold_units'],str(p['product_id'])))
     established=[p for p in ranked if p['weeks_available']>=4 and p['soldout_weeks']>=2]
     repeated=sum(p['soldout_weeks']>=2 for p in products)
     frequent=sum(p['soldout_weeks']>=3 for p in products)
     OUT.mkdir(exist_ok=True)
     story=[para('What keeps selling out?', 'ReportTitle'),para(f"Eight completed weeks | {s['period_from']} to {s['period_to']}",'ReportH1'),para(f"Source generated {data['source']['generated_at']}. Historical weekly data in America/Los_Angeles.",'ReportSmall')]
-    story += [table(['Eligible products','Sellout events','Repeat products (2+)','Weighted sell-through'],[[num(s['product_count']),num(s['exact_sellout_occurrences']),num(repeated),pct(s['total_sold_units']/s['total_allocated_units'])]],[128,128,128,128]),Spacer(1,14)]
-    p=ranked[0]
-    story.append(para(f"{p['product_name']} has the most observed sellout weeks: {p['soldout_weeks']} of {p['weeks_available']} offered weeks ({pct(p['sellout_rate'])}). It sold {num(p['total_sold_units'])} of {num(p['total_allocated_units'])} allocated units across this window."))
+    story += [table(['Eligible products','Sellout events','Repeat products (2+)','Weighted sell-through'],[[num(s['product_count']),num(s['exact_sellout_occurrences']),num(repeated),pct(s['total_sold_units']/s['total_allocated_units'] if s['total_allocated_units'] else 0)]],[128,128,128,128]),Spacer(1,14)]
+    if ranked:
+        p=ranked[0]
+        story.append(para(f"{p['product_name']} has the most observed sellout weeks: {p['soldout_weeks']} of {p['weeks_available']} offered weeks ({pct(p['sellout_rate'])}). It sold {num(p['total_sold_units'])} of {num(p['total_allocated_units'])} allocated units across this window."))
     story.append(para(f"{num(repeated)} products exhausted allocations in at least two weeks; {num(frequent)} did so in at least three. These are observed repeat events, not proof of unmet retail demand."))
-    story.append(weekly_chart(weeks))
-    latest=weeks[-1];prior=weeks[-2]
-    story.append(para(f"The latest week ended {latest['period_to']} with {latest['exact_sellouts']} sellouts among {latest['eligible_product_count']} eligible products ({pct(latest['exact_sellouts']/latest['eligible_product_count'])}). The prior week recorded {prior['exact_sellouts']}. Product mix and allocations change, so this comparison does not by itself show a change in consumer demand."))
+    if weeks:
+        story.append(weekly_chart(weeks))
+        latest=weeks[-1];prior=weeks[-2] if len(weeks)>1 else latest
+        latest_rate=latest['exact_sellouts']/latest['eligible_product_count'] if latest['eligible_product_count'] else 0
+        story.append(para(f"The latest week ended {latest['period_to']} with {latest['exact_sellouts']} sellouts among {latest['eligible_product_count']} eligible products ({pct(latest_rate)}). The prior week recorded {prior['exact_sellouts']}. Product mix and allocations change, so this comparison does not by itself show a change in consumer demand."))
     story.append(para('Scope: allocation exhaustion measured from weekly order totals. Submitted and pending orders are included. Daily sellout timing, retail inventory outages and lost sales cannot be calculated from this endpoint.','ReportSmall'))
     story += [PageBreak(),para('The repeat-sellout leaderboard','ReportH1'),para('Products below were offered in at least four of the eight weeks and sold out at least twice. Ranked by exact sellout weeks, then frequency and units sold. Coverage is shown so short histories remain visible.')]
     rows=[]
     for p in established[:20]:
-        rows.append([p['product_name'],f"{p['soldout_weeks']}/{p['weeks_available']}",pct(p['sellout_rate']),f"{num(p['total_sold_units'])} / {num(p['total_allocated_units'])}",pct(p['total_sold_units']/p['total_allocated_units'])])
+        rows.append([p['product_name'],f"{p['soldout_weeks']}/{p['weeks_available']}",pct(p['sellout_rate']),f"{num(p['total_sold_units'])} / {num(p['total_allocated_units'])}",pct(p['total_sold_units']/p['total_allocated_units'] if p['total_allocated_units'] else 0)])
     story.append(table(['Product','Weeks out','Frequency','Sold / allocated','Sell-through'],rows,[229,53,65,100,65]))
     story.append(Spacer(1,10))
     story.append(para(f"Frequency = sold-out weeks / eligible offered weeks. Sell-through = total units sold / total units allocated. A product absent from a week is not counted as a failed sale. All {num(s['product_count'])} eligible products and all original source rows are available in the workbook.",'ReportSmall'))
     story += [PageBreak(),para('Allocation size changes the interpretation','ReportH1')]
-    p=ranked[0]
-    story.append(allocation_chart(p,weeks,data['history_columns']))
-    story.append(para(f"{p['product_name']} sold out {p['soldout_weeks']} times, but its latest-week state is {p['latest_week_state'].replace('_',' ')}. Its current consecutive calendar-week sellout streak is {p['latest_sellout_streak']}; its longest streak was {p['longest_sellout_streak']}. Review the weekly allocation bars before making a supply decision."))
+    if ranked:
+        p=ranked[0]
+        story.append(allocation_chart(p,weeks,data['history_columns']))
+        story.append(para(f"{p['product_name']} sold out {p['soldout_weeks']} times, but its latest-week state is {p['latest_week_state'].replace('_',' ')}. Its current consecutive calendar-week sellout streak is {p['latest_sellout_streak']}; its longest streak was {p['longest_sellout_streak']}. Review the weekly allocation bars before making a supply decision."))
     limited=[p for p in ranked if p['weeks_available']<4 and p['soldout_weeks']>=2][:6]
     story.append(para('Strong rates with limited history','ReportH1'))
     story.append(table(['Product','Sold-out / offered','Sold / allocated'],[[p['product_name'],f"{p['soldout_weeks']} / {p['weeks_available']}",f"{num(p['total_sold_units'])} / {num(p['total_allocated_units'])}"] for p in limited],[300,100,112]))
@@ -152,7 +168,7 @@ def build():
         story.append(para(title,'ReportH1'))
         rows=[]
         for name,g in breakdown(products,field)[:limit]:
-            rows.append([name,num(g['products']),num(g['events']),pct(g['events']/g['offered']),pct(g['sold']/g['allocated'])])
+            rows.append([name,num(g['products']),num(g['events']),pct(g['events']/g['offered'] if g['offered'] else 0),pct(g['sold']/g['allocated'] if g['allocated'] else 0)])
         story.append(table(['Group','Products','Events','Event rate','Sell-through'],rows,[255,55,58,72,72]))
         story.append(Spacer(1,12))
     story += [PageBreak(),para('Definitions, audit and source','ReportH1')]
@@ -171,7 +187,8 @@ def build():
     for heading,text in notes:
         story.append(Paragraph('<b>'+escape(heading)+'.</b> '+escape(text),styles['ReportBody']))
     story.append(Spacer(1,10))
-    story.append(KeepTogether([table(['Audit measure','Count'],[['Original product-week rows',num(s['source_row_count'])],['Eligible product-weeks',num(s['eligible_product_weeks'])],['Excluded merchandise',num(s['excluded_rows']['non_merchandise'])],['Excluded trade samples',num(s['excluded_rows']['trade_samples'])],['Excluded zero/unlimited allocations',num(s['excluded_rows']['zero_or_unlimited'])],['Anomaly records',num(len(data['quality']['anomaly_rows']))]],[360,152])]))
+    excluded_rows = s.get('excluded_rows', {})
+    story.append(KeepTogether([table(['Audit measure','Count'],[['Original product-week rows',num(s['source_row_count'])],['Eligible product-weeks',num(s['eligible_product_weeks'])],['Excluded merchandise',num(excluded_rows.get('non_merchandise', 0))],['Excluded trade samples',num(excluded_rows.get('trade_samples', 0))],['Excluded zero/unlimited allocations',num(excluded_rows.get('zero_or_unlimited', 0))],['Anomaly records',num(len(data['quality']['anomaly_rows']))]],[360,152])]))
     path=OUT/'Bamboo_Sellout_Report_8_Weeks.pdf'
     SimpleDocTemplate(str(path),pagesize=(595.28,841.89),leftMargin=42,rightMargin=41.28,topMargin=42,bottomMargin=48,title='Panda Sellout Intelligence - Eight Week Report',author='Panda Sellout Intelligence').build(story,onFirstPage=footer,onLaterPages=footer)
     write_csvs(data)

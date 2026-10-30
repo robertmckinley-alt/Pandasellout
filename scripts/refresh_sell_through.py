@@ -6,9 +6,11 @@ import json
 import math
 import re
 import statistics
+import time
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -100,17 +102,22 @@ def build_dataset(api):
             source_row_count += 1
             pid = product.get('product_id')
             reason = exclusion(product)
-            issues = row_anomalies(product)
-            if pid in seen: issues.append('duplicate_product_week')
-            seen.add(pid)
-            for issue in issues: quality_counts[issue]+=1
-            if issues: anomaly_rows.append({'week_id':week['id'],'product_id':pid,'product_name':product.get('product_name'),'issues':issues})
             if not week['is_completed']: reason = 'incomplete_week'
             if reason:
                 excluded[reason]+=1
                 excluded_rows.append({**{k:product.get(k) for k in ('product_id','product_name','brand_name','category_name','allocated_units','sold_units','unsold_units','sold_revenue')},'week_id':week['id'],'reason':reason})
                 continue
-            if 'duplicate_product_week' in issues: continue
+            issues = row_anomalies(product)
+            if pid in seen:
+                issues.append('duplicate_product_week')
+                reason = 'duplicate_product_week'
+            seen.add(pid)
+            for issue in issues: quality_counts[issue]+=1
+            if issues: anomaly_rows.append({'week_id':week['id'],'product_id':pid,'product_name':product.get('product_name'),'issues':issues})
+            if reason:
+                excluded[reason]+=1
+                excluded_rows.append({**{k:product.get(k) for k in ('product_id','product_name','brand_name','category_name','allocated_units','sold_units','unsold_units','sold_revenue')},'week_id':week['id'],'reason':reason})
+                continue
             allocated,sold,unsold = [number(product.get(k)) for k in ('allocated_units','sold_units','unsold_units')]
             st=sold/allocated
             row={**product,'week_id':week['id'],'allocated_units':allocated,'sold_units':sold,'unsold_units':unsold,'sell_through':round(st,4),'sold_revenue':number(product.get('sold_revenue')),'order_count':number(product.get('order_count')),'is_sellout':not issues and allocated>0 and sold==allocated and unsold==0,'is_near_sellout':not issues and st>=.9,'anomalies':issues}
@@ -120,9 +127,11 @@ def build_dataset(api):
             for k in ('allocated_units','sold_units','unsold_units','sold_revenue'): week['eligible_'+k]+=row[k]
             week['exact_sellouts']+=int(row['is_sellout'])
             week['near_sellouts']+=int(row['is_near_sellout'])
+        if not week['is_completed']: continue
         week['eligible_sold_revenue']=round(week['eligible_sold_revenue'],2)
         week['eligible_sell_through']=round(week['eligible_sold_units']/week['eligible_allocated_units'],4) if week['eligible_allocated_units'] else 0
         weeks.append(week)
+    weeks = weeks[-8:]
     recent_ids={w['id'] for w in weeks[-4:]}
     prior_ids={w['id'] for w in weeks[-8:-4]}
     products=[]
@@ -131,10 +140,12 @@ def build_dataset(api):
         recent=[r for r in rows if r['week_id'] in recent_ids]; prior=[r for r in rows if r['week_id'] in prior_ids]
         median=statistics.median(r['allocated_units'] for r in rows)
         signal,adjustment,price,rationale=classify(rows,count,median,sells,near,recent)
-        by_week={r['week_id']:r for r in rows}; current=longest=0
+        by_week={r['week_id']:r for r in rows}; current=longest=0; prev_w=None
         for w in weeks:
-            current=current+1 if by_week.get(w['id'],{}).get('is_sellout') else 0
+            adjacent=prev_w is not None and date.fromisoformat(w['period_from'][:10])-date.fromisoformat(prev_w['period_from'][:10])==timedelta(days=7)
+            current=(current+1 if adjacent else 1) if by_week.get(w['id'],{}).get('is_sellout') else 0
             longest=max(longest,current)
+            prev_w=w
         last=by_week.get(weeks[-1]['id']) if weeks else None
         latest_state='not_offered' if last is None else ('anomaly' if last['anomalies'] else 'sellout' if last['is_sellout'] else 'near_sellout' if last['is_near_sellout'] else 'available')
         anomaly_count=sum(bool(r['anomalies']) for r in rows)
@@ -143,9 +154,9 @@ def build_dataset(api):
         recent_avg=statistics.mean(r['sold_units'] for r in recent) if recent else None
         prior_avg=statistics.mean(r['sold_units'] for r in prior) if prior else None
         product={k:first.get(k) for k in ('product_name','brand_name','category_name','package_type','net_weight','uom')}
-        product.update(product_id=pid,weeks_available=count,soldout_weeks=sells,near_sellout_weeks=near,sellout_rate=round(sells/count,4),coverage_rate=round(count/len(weeks),4),latest_sellout_streak=current,longest_sellout_streak=longest,latest_week_state=latest_state,anomaly_count=anomaly_count,weighted_sell_through=round(weighted_sell_through(rows),4),recent_4_week_sell_through=round(weighted_sell_through(recent),4),total_allocated_units=total_allocated,total_sold_units=total_sold,total_unsold_units=sum(r['unsold_units'] for r in rows),total_sold_revenue=round(revenue,2),total_order_count=sum(r['order_count'] for r in rows),median_weekly_allocated=median,median_weekly_sold=statistics.median(r['sold_units'] for r in rows),p75_weekly_sold=round(percentile([r['sold_units'] for r in rows],.75),1),average_weekly_sold=round(total_sold/count,1),realized_revenue_per_unit=round(revenue/total_sold,2) if total_sold else 0,recent_units_trend_pct=round((recent_avg-prior_avg)/prior_avg,4) if recent_avg is not None and prior_avg else None,signal=signal,volume_adjustment_pct=0,recommended_weekly_allocation=None,price_signal=price,rationale=rationale,recommendation='Manual supply review' if sells>=3 and not anomaly_count else 'Monitor; no automatic change',history=[[r[k] for k in HISTORY_COLUMNS] for r in rows])
+        product.update(product_id=pid,weeks_available=count,soldout_weeks=sells,near_sellout_weeks=near,sellout_rate=round(sells/count,4),coverage_rate=round(count/len(weeks),4) if weeks else 0,latest_sellout_streak=current,longest_sellout_streak=longest,latest_week_state=latest_state,anomaly_count=anomaly_count,weighted_sell_through=round(weighted_sell_through(rows),4),recent_4_week_sell_through=round(weighted_sell_through(recent),4),total_allocated_units=total_allocated,total_sold_units=total_sold,total_unsold_units=sum(r['unsold_units'] for r in rows),total_sold_revenue=round(revenue,2),total_order_count=sum(r['order_count'] for r in rows),median_weekly_allocated=median,median_weekly_sold=statistics.median(r['sold_units'] for r in rows),p75_weekly_sold=round(percentile([r['sold_units'] for r in rows],.75),1),average_weekly_sold=round(total_sold/count,1),realized_revenue_per_unit=round(revenue/total_sold,2) if total_sold else 0,recent_units_trend_pct=round((recent_avg-prior_avg)/prior_avg,4) if recent_avg is not None and prior_avg else None,signal=signal,volume_adjustment_pct=0,recommended_weekly_allocation=None,price_signal=price,rationale=rationale,recommendation='Manual supply review' if sells>=3 and not anomaly_count else 'Monitor; no automatic change',history=[[r[k] for k in HISTORY_COLUMNS] for r in rows])
         products.append(product)
-    products.sort(key=lambda p:(-p['soldout_weeks'],-p['sellout_rate'],-p['total_sold_units']))
+    products.sort(key=lambda p:(-p['soldout_weeks'],-p['sellout_rate'],-p['total_sold_units'],str(p['product_id'])))
     summary={'week_count':len(weeks),'period_from':weeks[0]['period_from'] if weeks else None,'period_to':weeks[-1]['period_to'] if weeks else None,'product_count':len(products),'recurring_sellout_count':sum(p['soldout_weeks']>=3 for p in products),'chronic_sellout_count':sum(p['signal']=='Chronic sellout' for p in products),'fast_mover_count':sum(p['signal'] in ('Consistent fast mover','Emerging shortage') for p in products),'slow_mover_count':sum(p['signal']=='Slow mover' for p in products),'excluded_rows':dict(excluded),'source_row_count':source_row_count,'eligible_product_weeks':sum(p['weeks_available'] for p in products),'exact_sellout_occurrences':sum(p['soldout_weeks'] for p in products)}
     for k in ('allocated_units','sold_units','unsold_units','sold_revenue'): summary['total_'+k]=round(sum(w['eligible_'+k] for w in weeks),2)
     summary['weighted_sell_through']=round(summary['total_sold_units']/summary['total_allocated_units'],4) if summary['total_allocated_units'] else 0
@@ -153,8 +164,15 @@ def build_dataset(api):
     return {'schema_version':'2026-10-18-a','source':{'url':API_URL,'generated_at':generated,'state_code':api.get('state_code'),'timezone':'America/Los_Angeles','sold_order_statuses':api.get('sold_order_statuses',[]),'data_status':'Historical completed weekly allocations','period_note':'Sunday-Saturday allocation reports. Latest period and coverage follow the source.','sales_note':'Sold units include source order statuses, including pending and submitted. They are wholesale allocation order demand, not confirmed consumer retail sales.','limitations':['Weekly totals do not establish day or time of sellout, hours unavailable, or repeated stockouts within a week.','Missing product weeks are not assumed to have zero demand.','Allocation sizes change; sales do not measure unmet demand or lost revenue.']},'criteria':{'exact_sellout':'Positive allocation; sold equals allocated; unsold equals zero; no quantity or source consistency anomalies.','near_sellout':'At least 90% sell-through, including exact sellouts; no anomalies.','recurring_sellout':'Exact sellout in at least 3 offered weeks.','minimum_history_weeks':4,'minimum_median_weekly_allocation':25,'merchandise_exclusion_rules':['Brand starts with Non Marijuana Products (case insensitive)','Category contains Accessories & Merch (case insensitive)','Exact category: Phat Panda Neck Gaiter/Face Covering','Exact category: Vape Carry Case'],'frequency_denominator':'Completed weeks with positive finite allocations after sample and merchandise exclusions.','excluded':'Unlimited/zero allocations, samples, non-marijuana merchandise, missing identity, incomplete periods.','recommendations':'Manual review only. No numeric price, allocation or lost-sales forecast.'},'history_columns':HISTORY_COLUMNS,'summary':summary,'weeks':weeks,'products':products,'excluded_product_rows':excluded_rows,'quality':{'anomaly_counts':dict(quality_counts),'anomaly_rows':anomaly_rows,'renamed_product_count':sum(len(n)>1 for n in names.values()),'missing_calendar_weeks_note':'Product absence is treated as not offered, not as a zero-sale or zero-stock observation.'}}
 
 def fetch_api():
-    request=urllib.request.Request(API_URL,headers={'User-Agent':'sellout-intelligence/1.0'})
-    with urllib.request.urlopen(request,timeout=90) as response: return json.load(response)
+    for attempt in range(3):
+        try:
+            request=urllib.request.Request(API_URL,headers={'User-Agent':'sellout-intelligence/1.0'})
+            with urllib.request.urlopen(request,timeout=90) as response: return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500 or attempt == 2: raise
+        except urllib.error.URLError:
+            if attempt == 2: raise
+        time.sleep(2 ** attempt)
 
 def main():
     parser=argparse.ArgumentParser()
